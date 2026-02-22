@@ -1,0 +1,1895 @@
+You know in Windows when you want to find that file its to hard.I know that so I write this code for you.But I do linux and mac version so if you want to use in Windows you have to change the code.But don't get angry if you change the code you can understand the algorithm and I want to build an AI system so if you want to build AI with me please thell me.
+
+The code:
+"""
+File Vault — Time-grouped file manager
+Scans a folder, filters by size, groups files into time buckets,
+and lets you instantly search & open any file.
+Run:  python3 file_vault.py
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import os, time, threading, subprocess, shutil, math, csv, json as _json
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ─── TIME BUCKETS ────────────────────────────────────────────────────────────
+
+BUCKETS = [
+    ('Just now',       0,           60),
+    ('Last hour',      60,          3600),
+    ('Today',          3600,        86400),
+    ('Yesterday',      86400,       172800),
+    ('This week',      172800,      604800),
+    ('Last week',      604800,      1209600),
+    ('This month',     1209600,     2592000),
+    ('Last 3 months',  2592000,     7776000),
+    ('This year',      7776000,     31536000),
+    ('Older',          31536000,    float('inf')),
+]
+
+def get_bucket(age_seconds):
+    for name, lo, hi in BUCKETS:
+        if lo <= age_seconds < hi:
+            return name
+    return 'Older'
+
+def fmt_size(b):
+    for unit in ('B','KB','MB','GB','TB'):
+        if b < 1024:
+            return f'{b:.1f} {unit}'
+        b /= 1024
+    return f'{b:.1f} PB'
+
+def fmt_age(age_seconds):
+    s = int(age_seconds)
+    if s < 60:   return f'{s}s ago'
+    if s < 3600: return f'{s//60}m ago'
+    if s < 86400:return f'{s//3600}h ago'
+    return f'{s//86400}d ago'
+
+def ext_icon(ext):
+    icons = {
+        '.py':'🐍', '.js':'🟨', '.ts':'🔷', '.html':'🌐', '.css':'🎨',
+        '.json':'📋', '.xml':'📄', '.yaml':'📄', '.yml':'📄',
+        '.txt':'📝', '.md':'📝', '.csv':'📊', '.xlsx':'📊', '.pdf':'📕',
+        '.png':'🖼', '.jpg':'🖼', '.jpeg':'🖼', '.gif':'🖼', '.svg':'🖼',
+        '.mp4':'🎬', '.mov':'🎬', '.avi':'🎬', '.mkv':'🎬',
+        '.mp3':'🎵', '.wav':'🎵', '.flac':'🎵',
+        '.zip':'📦', '.tar':'📦', '.gz':'📦', '.rar':'📦',
+        '.exe':'⚙', '.app':'⚙', '.dmg':'💿',
+        '.blend':'🎲', '.obj':'🎲', '.fbx':'🎲',
+    }
+    return icons.get(ext.lower(), '📄')
+
+# ─── SCANNER ─────────────────────────────────────────────────────────────────
+
+class FileRecord:
+    __slots__ = ('path','name','ext','size','mtime','age','bucket')
+    def __init__(self, path, stat):
+        self.path   = path
+        self.name   = os.path.basename(path)
+        self.ext    = os.path.splitext(path)[1]
+        self.size   = stat.st_size
+        self.mtime  = stat.st_mtime
+        now         = time.time()
+        self.age    = now - self.mtime
+        self.bucket = get_bucket(self.age)
+
+class _FakeRecord:
+    """A FileRecord-compatible object built from imported data (no real stat)."""
+    __slots__ = ('path','name','ext','size','mtime','age','bucket')
+    def __init__(self, path, name, size, mtime):
+        self.path   = path
+        self.name   = name
+        self.ext    = os.path.splitext(name)[1]
+        self.size   = size
+        self.mtime  = mtime
+        self.age    = time.time() - mtime
+        self.bucket = get_bucket(self.age)
+
+def scan_directory(root_path, min_bytes, max_bytes, progress_cb=None):
+    results = []
+    total   = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            # skip hidden dirs
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            for fname in filenames:
+                if fname.startswith('.'): continue
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    st = os.stat(fpath)
+                    if min_bytes <= st.st_size <= max_bytes:
+                        results.append(FileRecord(fpath, st))
+                    total += 1
+                    if progress_cb and total % 200 == 0:
+                        progress_cb(total, len(results))
+                except (PermissionError, OSError):
+                    continue
+    except (PermissionError, OSError):
+        pass
+    return results
+
+# ─── MAIN APP ────────────────────────────────────────────────────────────────
+
+class FileVault:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title('File Vault')
+        self.root.geometry('1100x700')
+        self.root.configure(bg='#1a1a1a')
+        self.root.minsize(800, 500)
+
+        self.all_files   = []
+        self.shown_files = []
+        self.scan_root   = tk.StringVar(value=str(Path.home()))
+        self.min_size_var= tk.StringVar(value='0')
+        self.max_size_var= tk.StringVar(value='10000')
+        self.min_unit    = tk.StringVar(value='KB')
+        self.max_unit    = tk.StringVar(value='MB')
+        self.search_var  = tk.StringVar()
+        self.sort_col    = 'age'
+        self.sort_rev    = False
+        self.selected_bucket = None  # None = all
+        self._scanning   = False
+
+        self._build_ui()
+        self.search_var.trace_add('write', lambda *_: self._apply_filters())
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        root = self.root
+        style = ttk.Style()
+        style.theme_use('default')
+        style.configure('Treeview',
+            background='#1e1e1e', foreground='#ccc',
+            fieldbackground='#1e1e1e', rowheight=22,
+            font=('Segoe UI', 9), borderwidth=0)
+        style.configure('Treeview.Heading',
+            background='#2a2a2a', foreground='#aaa',
+            font=('Segoe UI', 9, 'bold'), relief='flat')
+        style.map('Treeview',
+            background=[('selected','#e87d0d')],
+            foreground=[('selected','white')])
+        style.configure('Vertical.TScrollbar',
+            background='#2a2a2a', troughcolor='#111',
+            arrowcolor='#666', borderwidth=0)
+
+        # ── TOP BAR
+        tb = tk.Frame(root, bg='#2a2a2a', height=44)
+        tb.pack(fill='x')
+        tb.pack_propagate(False)
+
+        tk.Label(tb, text=' 🗂 File Vault', bg='#2a2a2a', fg='#e87d0d',
+                 font=('Segoe UI', 12, 'bold')).pack(side='left', padx=10)
+        self._vline(tb)
+
+        # Folder picker
+        tk.Label(tb, text='Folder:', bg='#2a2a2a', fg='#888',
+                 font=('Segoe UI', 9)).pack(side='left', padx=(6,2))
+        folder_entry = tk.Entry(tb, textvariable=self.scan_root,
+                                bg='#1e1e1e', fg='#ddd', relief='flat',
+                                insertbackground='white', font=('Segoe UI', 9),
+                                width=30)
+        folder_entry.pack(side='left', ipady=4)
+        tk.Button(tb, text='Browse', bg='#333', fg='#aaa', relief='flat',
+                  bd=0, padx=8, pady=5, cursor='hand2', font=('Segoe UI', 9),
+                  command=self._browse_folder).pack(side='left', padx=4)
+
+        self._vline(tb)
+
+        # Size filter
+        tk.Label(tb, text='Size:', bg='#2a2a2a', fg='#888',
+                 font=('Segoe UI', 9)).pack(side='left', padx=(6,2))
+        tk.Entry(tb, textvariable=self.min_size_var, width=5,
+                 bg='#1e1e1e', fg='#ddd', relief='flat',
+                 insertbackground='white', font=('Segoe UI', 9)).pack(side='left', ipady=4)
+        units = ['B','KB','MB','GB']
+        ttk.Combobox(tb, textvariable=self.min_unit, values=units,
+                     width=4, state='readonly').pack(side='left', padx=(2,1))
+        tk.Label(tb, text='–', bg='#2a2a2a', fg='#666',
+                 font=('Segoe UI', 9)).pack(side='left')
+        tk.Entry(tb, textvariable=self.max_size_var, width=6,
+                 bg='#1e1e1e', fg='#ddd', relief='flat',
+                 insertbackground='white', font=('Segoe UI', 9)).pack(side='left', ipady=4, padx=(1,0))
+        ttk.Combobox(tb, textvariable=self.max_unit, values=units,
+                     width=4, state='readonly').pack(side='left', padx=(2,0))
+
+        self._vline(tb)
+
+        self.scan_btn = tk.Button(tb, text='⟳ Scan', bg='#e87d0d', fg='white',
+                  relief='flat', bd=0, padx=12, pady=5, cursor='hand2',
+                  font=('Segoe UI', 9, 'bold'), command=self.start_scan)
+        self.scan_btn.pack(side='left', padx=6)
+
+        # Search
+        self._vline(tb)
+        tk.Label(tb, text='🔍', bg='#2a2a2a', fg='#888',
+                 font=('Segoe UI', 11)).pack(side='left', padx=(6,2))
+        search_e = tk.Entry(tb, textvariable=self.search_var,
+                            bg='#1e1e1e', fg='#ddd', relief='flat',
+                            insertbackground='white', font=('Segoe UI', 9),
+                            width=22)
+        search_e.pack(side='left', ipady=4)
+        search_e.bind('<Escape>', lambda e: self.search_var.set(''))
+
+        # Stats label
+        self.stats_var = tk.StringVar(value='No scan yet')
+        tk.Label(tb, textvariable=self.stats_var, bg='#2a2a2a', fg='#666',
+                 font=('Consolas', 9)).pack(side='right', padx=10)
+        self._vline(tb)
+        tk.Button(tb, text='⬆ Export', bg='#e87d0d', fg='white',
+                  relief='flat', bd=0, padx=10, pady=5, cursor='hand2',
+                  font=('Segoe UI', 9, 'bold'),
+                  command=self.export_results).pack(side='right', padx=4)
+        tk.Button(tb, text='⬇ Import', bg='#335533', fg='#8eff8e',
+                  relief='flat', bd=0, padx=10, pady=5, cursor='hand2',
+                  font=('Segoe UI', 9, 'bold'),
+                  command=self.import_results).pack(side='right', padx=(0,4))
+        self._vline(tb)
+        tk.Button(tb, text='📥 Take All Files', bg='#2a4a7a', fg='#8bcfff',
+                  relief='flat', bd=0, padx=12, pady=5, cursor='hand2',
+                  font=('Segoe UI', 9, 'bold'),
+                  command=self.take_all_files).pack(side='right', padx=4)
+
+        # ── PROGRESS BAR
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(root, variable=self.progress_var,
+                                            maximum=100, mode='indeterminate')
+
+        # ── MAIN AREA
+        main = tk.Frame(root, bg='#1a1a1a')
+        main.pack(fill='both', expand=True)
+
+        # ── LEFT: time buckets
+        lp = tk.Frame(main, bg='#222', width=160)
+        lp.pack(side='left', fill='y')
+        lp.pack_propagate(False)
+
+        tk.Label(lp, text='TIME RANGE', bg='#222', fg='#666',
+                 font=('Segoe UI', 8, 'bold'), anchor='w',
+                 padx=10, pady=8).pack(fill='x')
+        tk.Frame(lp, bg='#111', height=1).pack(fill='x')
+
+        self._bucket_btns = {}
+        self._all_btn = self._make_bucket_btn(lp, '⊞  All Files', None)
+        tk.Frame(lp, bg='#2a2a2a', height=1).pack(fill='x', pady=2)
+        for name, lo, hi in BUCKETS:
+            self._make_bucket_btn(lp, name, name)
+
+        # Size summary at bottom of left panel
+        tk.Frame(lp, bg='#111', height=1).pack(fill='x', pady=(8,0))
+        self._size_summary = tk.Label(lp, text='', bg='#222', fg='#555',
+                                      font=('Segoe UI', 8), wraplength=140,
+                                      justify='left', padx=10, pady=4)
+        self._size_summary.pack(fill='x')
+
+        # ── RIGHT: file list
+        right = tk.Frame(main, bg='#1a1a1a')
+        right.pack(side='left', fill='both', expand=True)
+
+        # Columns
+        cols = ('icon','name','size','modified','age','path')
+        self.tree = ttk.Treeview(right, columns=cols, show='headings',
+                                  selectmode='extended')
+        col_cfg = [
+            ('icon',     '',         30,  False),
+            ('name',     'Name',    220,  True),
+            ('size',     'Size',     80,  True),
+            ('modified', 'Modified',140,  True),
+            ('age',      'Age',      90,  True),
+            ('path',     'Path',    340,  True),
+        ]
+        for cid, lbl, w, stretch in col_cfg:
+            self.tree.heading(cid, text=lbl,
+                              command=lambda c=cid: self._sort_by(c))
+            self.tree.column(cid, width=w, minwidth=30,
+                             stretch=stretch, anchor='w' if cid != 'size' else 'e')
+
+        vsb = ttk.Scrollbar(right, orient='vertical', command=self.tree.yview)
+        hsb = ttk.Scrollbar(right, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side='right', fill='y')
+        hsb.pack(side='bottom', fill='x')
+        self.tree.pack(fill='both', expand=True)
+
+        self.tree.bind('<Double-1>',       self._on_double_click)
+        self.tree.bind('<Return>',         self._on_double_click)
+        self.tree.bind('<Button-3>',       self._on_right_click)
+        self.tree.bind('<<TreeviewSelect>>',self._on_select)
+
+        # ── BOTTOM STATUS
+        sb = tk.Frame(root, bg='#1e1e1e', height=24)
+        sb.pack(fill='x', side='bottom')
+        sb.pack_propagate(False)
+        self.bottom_var = tk.StringVar(value='Ready  |  Double-click to open  |  Right-click for options')
+        tk.Label(sb, textvariable=self.bottom_var, bg='#1e1e1e', fg='#555',
+                 font=('Segoe UI', 8), anchor='w', padx=8).pack(fill='x')
+
+        # ── CONTEXT MENU
+        self.ctx = tk.Menu(root, tearoff=0, bg='#2a2a2a', fg='#ccc',
+                           activebackground='#e87d0d', activeforeground='white',
+                           relief='flat', bd=1)
+        self.ctx.add_command(label='Open',             command=self._open_selected)
+        self.ctx.add_command(label='Reveal in Finder', command=self._reveal_selected)
+        self.ctx.add_separator()
+        self.ctx.add_command(label='Copy Path',        command=self._copy_path)
+        self.ctx.add_command(label='Copy Name',        command=self._copy_name)
+        self.ctx.add_separator()
+        self.ctx.add_command(label='Delete',           command=self._delete_selected,
+                             foreground='#e44')
+
+        self._highlight_bucket(None)
+
+    def _make_bucket_btn(self, parent, label, bucket_id):
+        btn = tk.Button(parent, text=label, bg='#222', fg='#999',
+                        relief='flat', bd=0, anchor='w', padx=14, pady=5,
+                        font=('Segoe UI', 9), cursor='hand2',
+                        activebackground='#2a2a2a', activeforeground='#fff',
+                        command=lambda b=bucket_id: self._select_bucket(b))
+        btn.pack(fill='x')
+        self._bucket_btns[bucket_id] = btn
+        return btn
+
+    def _vline(self, parent):
+        tk.Frame(parent, bg='#444', width=1).pack(side='left', fill='y', padx=4, pady=8)
+
+    # ── SCAN ─────────────────────────────────────────────────────────────────
+    def _parse_size(self, val_str, unit):
+        try:
+            v = float(val_str)
+        except ValueError:
+            return 0
+        mult = {'B':1,'KB':1024,'MB':1024**2,'GB':1024**3}
+        return int(v * mult.get(unit, 1))
+
+    def start_scan(self):
+        if self._scanning: return
+        path = self.scan_root.get().strip()
+        if not os.path.isdir(path):
+            messagebox.showerror('Error', f'Not a valid directory:\n{path}')
+            return
+        min_b = self._parse_size(self.min_size_var.get(), self.min_unit.get())
+        max_b = self._parse_size(self.max_size_var.get(), self.max_unit.get())
+        if min_b > max_b:
+            messagebox.showerror('Error', 'Min size must be ≤ Max size')
+            return
+
+        self._scanning = True
+        self.scan_btn.configure(state='disabled', text='Scanning…')
+        self.all_files = []
+        self.tree.delete(*self.tree.get_children())
+        self.progress_bar.pack(fill='x', before=self.tree.master.master)
+        self.progress_bar.start(12)
+        self.stats_var.set('Scanning…')
+
+        def do_scan():
+            def cb(total, found):
+                self.root.after(0, lambda: self.stats_var.set(
+                    f'Scanned {total:,} files  |  Found {found:,}'))
+            files = scan_directory(path, min_b, max_b, cb)
+            self.root.after(0, lambda: self._scan_done(files))
+
+        threading.Thread(target=do_scan, daemon=True).start()
+
+    def _scan_done(self, files):
+        self._scanning = False
+        self.all_files = files
+        self.scan_btn.configure(state='normal', text='⟳ Scan')
+        self.progress_bar.stop()
+        self.progress_bar.pack_forget()
+        self._update_bucket_counts()
+        self._apply_filters()
+        self.stats_var.set(
+            f'{len(files):,} files  |  '
+            f'{fmt_size(sum(f.size for f in files))} total')
+
+    # ── BUCKET PANEL ──────────────────────────────────────────────────────────
+    def _update_bucket_counts(self):
+        from collections import Counter
+        counts = Counter(f.bucket for f in self.all_files)
+        total  = len(self.all_files)
+        # All button
+        self._bucket_btns[None].configure(
+            text=f'⊞  All Files  ({total:,})')
+        for name, lo, hi in BUCKETS:
+            c = counts.get(name, 0)
+            btn = self._bucket_btns.get(name)
+            if btn:
+                btn.configure(text=f'{name}  ({c:,})')
+        # Size summary
+        by_bucket = {}
+        for f in self.all_files:
+            by_bucket.setdefault(f.bucket, []).append(f.size)
+        lines = []
+        for name, lo, hi in BUCKETS:
+            sizes = by_bucket.get(name, [])
+            if sizes:
+                lines.append(f'{name[:12]}: {fmt_size(sum(sizes))}')
+        self._size_summary.configure(text='\n'.join(lines[:6]))
+
+    def _select_bucket(self, bucket_id):
+        self.selected_bucket = bucket_id
+        self._highlight_bucket(bucket_id)
+        self._apply_filters()
+
+    def _highlight_bucket(self, bucket_id):
+        for bid, btn in self._bucket_btns.items():
+            if bid == bucket_id:
+                btn.configure(bg='#3a2810', fg='#e87d0d')
+            else:
+                btn.configure(bg='#222', fg='#999')
+
+    # ── FILTER & DISPLAY ──────────────────────────────────────────────────────
+    def _apply_filters(self):
+        q = self.search_var.get().strip().lower()
+        bucket = self.selected_bucket
+
+        filtered = self.all_files
+        if bucket is not None:
+            filtered = [f for f in filtered if f.bucket == bucket]
+        if q:
+            filtered = [f for f in filtered
+                        if q in f.name.lower() or q in f.path.lower()]
+
+        # Sort
+        key_map = {
+            'name':     lambda f: f.name.lower(),
+            'size':     lambda f: f.size,
+            'modified': lambda f: f.mtime,
+            'age':      lambda f: f.age,
+            'path':     lambda f: f.path.lower(),
+            'icon':     lambda f: f.ext.lower(),
+        }
+        key_fn = key_map.get(self.sort_col, lambda f: f.age)
+        filtered.sort(key=key_fn, reverse=self.sort_rev)
+        self.shown_files = filtered
+
+        self._populate_tree(filtered)
+        count = len(filtered)
+        total_size = sum(f.size for f in filtered)
+        self.bottom_var.set(
+            f'{count:,} file{"s" if count!=1 else ""}  |  '
+            f'{fmt_size(total_size)}  |  '
+            f'Double-click to open  |  Right-click for options')
+
+    def _populate_tree(self, files):
+        tree = self.tree
+        tree.delete(*tree.get_children())
+        # Batch insert with alternating row tags
+        tree.tag_configure('odd',  background='#1e1e1e')
+        tree.tag_configure('even', background='#222222')
+        for i, f in enumerate(files):
+            icon = ext_icon(f.ext)
+            mod  = datetime.fromtimestamp(f.mtime).strftime('%Y-%m-%d  %H:%M')
+            tag  = 'odd' if i % 2 else 'even'
+            tree.insert('', 'end', iid=str(i), tags=(tag,), values=(
+                icon, f.name, fmt_size(f.size), mod, fmt_age(f.age), f.path))
+
+    # ── SORT ──────────────────────────────────────────────────────────────────
+    def _sort_by(self, col):
+        if self.sort_col == col:
+            self.sort_rev = not self.sort_rev
+        else:
+            self.sort_col = col
+            self.sort_rev = (col in ('size', 'modified'))
+        # Update heading arrows
+        arrow = ' ▼' if self.sort_rev else ' ▲'
+        labels = {'icon':'','name':'Name','size':'Size',
+                  'modified':'Modified','age':'Age','path':'Path'}
+        for c, lbl in labels.items():
+            self.tree.heading(c, text=lbl + (arrow if c == col else ''))
+        self._apply_filters()
+
+    # ── SELECTION ─────────────────────────────────────────────────────────────
+    def _on_select(self, e):
+        sel = self.tree.selection()
+        if not sel: return
+        paths = [self._iid_to_file(iid).path for iid in sel if self._iid_to_file(iid)]
+        if len(paths) == 1:
+            f = self._iid_to_file(sel[0])
+            if f:
+                self.bottom_var.set(
+                    f'{f.name}  |  {fmt_size(f.size)}  |  '
+                    f'Modified {fmt_age(f.age)}  |  {f.path}')
+        else:
+            total = sum(self._iid_to_file(i).size for i in sel if self._iid_to_file(i))
+            self.bottom_var.set(f'{len(sel)} selected  |  {fmt_size(total)}')
+
+    def _iid_to_file(self, iid):
+        try:
+            idx = int(iid)
+            return self.shown_files[idx] if 0 <= idx < len(self.shown_files) else None
+        except (ValueError, IndexError):
+            return None
+
+    def _selected_file_records(self):
+        return [self._iid_to_file(i) for i in self.tree.selection()
+                if self._iid_to_file(i)]
+
+    # ── ACTIONS ───────────────────────────────────────────────────────────────
+    def _on_double_click(self, e):
+        self._open_selected()
+
+    def _open_selected(self):
+        for f in self._selected_file_records():
+            try:
+                subprocess.Popen(['open', f.path])
+            except Exception as ex:
+                messagebox.showerror('Error', str(ex))
+
+    def _reveal_selected(self):
+        for f in self._selected_file_records():
+            try:
+                subprocess.Popen(['open', '-R', f.path])
+            except Exception as ex:
+                messagebox.showerror('Error', str(ex))
+
+    def _copy_path(self):
+        paths = [f.path for f in self._selected_file_records()]
+        if paths:
+            self.root.clipboard_clear()
+            self.root.clipboard_append('\n'.join(paths))
+
+    def _copy_name(self):
+        names = [f.name for f in self._selected_file_records()]
+        if names:
+            self.root.clipboard_clear()
+            self.root.clipboard_append('\n'.join(names))
+
+    def _delete_selected(self):
+        files = self._selected_file_records()
+        if not files: return
+        msg = (f'Delete {len(files)} file(s)?\n\nThis cannot be undone.'
+               if len(files) > 1 else
+               f'Delete:\n{files[0].name}\n\nThis cannot be undone.')
+        if not messagebox.askyesno('Confirm Delete', msg, icon='warning'):
+            return
+        errors = []
+        for f in files:
+            try:
+                os.remove(f.path)
+                self.all_files = [x for x in self.all_files if x.path != f.path]
+            except Exception as ex:
+                errors.append(f'{f.name}: {ex}')
+        if errors:
+            messagebox.showerror('Delete errors', '\n'.join(errors))
+        self._update_bucket_counts()
+        self._apply_filters()
+
+    def _on_right_click(self, e):
+        row = self.tree.identify_row(e.y)
+        if row:
+            if row not in self.tree.selection():
+                self.tree.selection_set(row)
+            self.ctx.post(e.x_root, e.y_root)
+
+    # ── BROWSE ────────────────────────────────────────────────────────────────
+    def _browse_folder(self):
+        path = filedialog.askdirectory(initialdir=self.scan_root.get(),
+                                       title='Select folder to scan')
+        if path:
+            self.scan_root.set(path)
+
+    # ── EXPORT ────────────────────────────────────────────────────────────────
+    def export_results(self):
+        if not self.shown_files:
+            messagebox.showwarning('Export', 'No files to export. Run a scan first.')
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension='.csv',
+            filetypes=[
+                ('CSV Spreadsheet',  '*.csv'),
+                ('JSON Report',      '*.json'),
+                ('Plain Text List',  '*.txt'),
+                ('All files',        '*.*'),
+            ],
+            title='Export File List')
+        if not path: return
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == '.json':
+                self._export_json(path)
+            elif ext == '.txt':
+                self._export_txt(path)
+            else:
+                self._export_csv(path)
+            messagebox.showinfo('Export', f'Exported {len(self.shown_files):,} files to:\n{os.path.basename(path)}')
+        except Exception as e:
+            messagebox.showerror('Export Error', str(e))
+
+    def _export_csv(self, path):
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Name', 'Size (bytes)', 'Size', 'Modified', 'Age', 'Bucket', 'Path'])
+            for rec in self.shown_files:
+                mod = datetime.fromtimestamp(rec.mtime).strftime('%Y-%m-%d %H:%M:%S')
+                writer.writerow([
+                    rec.name, rec.size, fmt_size(rec.size),
+                    mod, fmt_age(rec.age), rec.bucket, rec.path,
+                ])
+
+    def _export_json(self, path):
+        data = []
+        for rec in self.shown_files:
+            data.append({
+                'name':     rec.name,
+                'path':     rec.path,
+                'size':     rec.size,
+                'size_fmt': fmt_size(rec.size),
+                'modified': datetime.fromtimestamp(rec.mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                'mtime':    rec.mtime,
+                'age_sec':  rec.age,
+                'age_fmt':  fmt_age(rec.age),
+                'bucket':   rec.bucket,
+                'ext':      rec.ext,
+            })
+        payload = {
+            'exported':   time.strftime('%Y-%m-%d %H:%M:%S'),
+            'scan_root':  self.scan_root.get(),
+            'total_files':len(data),
+            'total_size': sum(r['size'] for r in data),
+            'files':      data,
+        }
+        with open(path, 'w', encoding='utf-8') as f:
+            _json.dump(payload, f, indent=2)
+
+    def _export_txt(self, path):
+        lines = [
+            f'File Vault Export — {time.strftime("%Y-%m-%d %H:%M:%S")}',
+            f'Scanned: {self.scan_root.get()}',
+            f'Files:   {len(self.shown_files):,}',
+            f'Size:    {fmt_size(sum(r.size for r in self.shown_files))}',
+            '-' * 80,
+        ]
+        current_bucket = None
+        for rec in self.shown_files:
+            if rec.bucket != current_bucket:
+                current_bucket = rec.bucket
+                lines += ['', f'── {current_bucket} ──']
+            lines.append(f'  {rec.name:<40} {fmt_size(rec.size):>10}  {rec.path}')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+    # ── IMPORT ────────────────────────────────────────────────────────────────
+    def import_results(self):
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ('CSV Spreadsheet', '*.csv'),
+                ('JSON Report',     '*.json'),
+                ('All files',       '*.*'),
+            ],
+            title='Import File List')
+        if not path: return
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == '.json':
+                records = self._import_json(path)
+            else:
+                records = self._import_csv(path)
+            if records is None: return
+            self.all_files    = records
+            self.shown_files  = records
+            self._update_bucket_counts()
+            self._apply_filters()
+            self.stats_var.set(
+                f'{len(records):,} files (imported)  |  '
+                f'{fmt_size(sum(r.size for r in records))} total')
+            self.status_var = getattr(self, 'status_var', None)
+            self.bottom_var.set(
+                f'Loaded {len(records):,} records from {os.path.basename(path)}')
+        except Exception as e:
+            messagebox.showerror('Import Error', str(e))
+
+    def _import_csv(self, path):
+        records = []
+        with open(path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    fpath = row.get('Path', '')
+                    name  = row.get('Name', os.path.basename(fpath))
+                    size  = int(row.get('Size (bytes)', 0))
+                    mtime_str = row.get('Modified', '')
+                    try:
+                        mtime = datetime.strptime(mtime_str, '%Y-%m-%d %H:%M:%S').timestamp()
+                    except ValueError:
+                        mtime = time.time()
+                    rec = _FakeRecord(fpath, name, size, mtime)
+                    records.append(rec)
+                except Exception:
+                    continue
+        return records
+
+    def _import_json(self, path):
+        with open(path, encoding='utf-8') as f:
+            payload = _json.load(f)
+        items = payload.get('files', payload) if isinstance(payload, dict) else payload
+        records = []
+        for item in items:
+            try:
+                fpath = item.get('path', '')
+                name  = item.get('name', os.path.basename(fpath))
+                size  = int(item.get('size', 0))
+                mtime = float(item.get('mtime', time.time()))
+                rec   = _FakeRecord(fpath, name, size, mtime)
+                records.append(rec)
+            except Exception:
+                continue
+        return records
+
+    # ── TAKE ALL FILES ────────────────────────────────────────────────────────
+    def take_all_files(self):
+        files = self.shown_files
+        if not files:
+            messagebox.showwarning('Take All Files', 'No files to take. Run a scan first.')
+            return
+
+        # Pick destination
+        dest = filedialog.askdirectory(title='Choose destination folder')
+        if not dest:
+            return
+
+        total = len(files)
+        total_size = sum(f.size for f in files)
+
+        # Ask copy or move
+        action = messagebox.askyesnocancel(
+            'Take All Files',
+            f'{total:,} files  ({fmt_size(total_size)})\n\n'
+            f'Destination:\n{dest}\n\n'
+            'Yes = Copy files\n'
+            'No  = Move files\n'
+            'Cancel = Abort')
+        if action is None:
+            return
+        operation = 'copy' if action else 'move'
+
+        # Build progress window
+        prog_win = tk.Toplevel(self.root)
+        prog_win.title('Taking files…')
+        prog_win.geometry('460x180')
+        prog_win.configure(bg='#1a1a1a')
+        prog_win.resizable(False, False)
+        prog_win.grab_set()
+
+        tk.Label(prog_win, text=f'{"Copying" if operation=="copy" else "Moving"} {total:,} files…',
+                 bg='#1a1a1a', fg='#ccc', font=('Segoe UI', 10)).pack(pady=(16,4))
+
+        file_lbl = tk.Label(prog_win, text='', bg='#1a1a1a', fg='#888',
+                            font=('Segoe UI', 8), wraplength=420)
+        file_lbl.pack()
+
+        bar_var = tk.DoubleVar(value=0)
+        bar = ttk.Progressbar(prog_win, variable=bar_var, maximum=total, length=400)
+        bar.pack(pady=8)
+
+        count_lbl = tk.Label(prog_win, text='0 / 0', bg='#1a1a1a', fg='#666',
+                             font=('Consolas', 9))
+        count_lbl.pack()
+
+        cancel_flag = [False]
+        tk.Button(prog_win, text='Cancel', bg='#3a3a3a', fg='#aaa',
+                  relief='flat', bd=0, padx=12, pady=4, cursor='hand2',
+                  font=('Segoe UI', 9),
+                  command=lambda: cancel_flag.__setitem__(0, True)).pack(pady=6)
+
+        def do_take():
+            done = 0
+            errors = []
+            skipped = 0
+            for rec in files:
+                if cancel_flag[0]:
+                    break
+                src = rec.path
+                if not os.path.exists(src):
+                    skipped += 1
+                    done += 1
+                    continue
+                # Preserve sub-folder structure option: flat copy into dest
+                dst_name = rec.name
+                dst_path = os.path.join(dest, dst_name)
+                # Avoid overwrite — append a counter suffix
+                if os.path.exists(dst_path) and os.path.abspath(src) != os.path.abspath(dst_path):
+                    base, ext = os.path.splitext(dst_name)
+                    counter = 1
+                    while os.path.exists(dst_path):
+                        dst_path = os.path.join(dest, f'{base}_{counter}{ext}')
+                        counter += 1
+                try:
+                    if operation == 'copy':
+                        shutil.copy2(src, dst_path)
+                    else:
+                        shutil.move(src, dst_path)
+                except Exception as e:
+                    errors.append(f'{rec.name}: {e}')
+                done += 1
+                self.root.after(0, lambda d=done, n=rec.name: (
+                    bar_var.set(d),
+                    file_lbl.config(text=n),
+                    count_lbl.config(text=f'{d:,} / {total:,}')
+                ))
+
+            def finish():
+                prog_win.destroy()
+                # Remove moved files from list
+                if operation == 'move' and not cancel_flag[0]:
+                    moved_paths = {f.path for f in files}
+                    self.all_files   = [f for f in self.all_files   if f.path not in moved_paths]
+                    self.shown_files = [f for f in self.shown_files if f.path not in moved_paths]
+                    self._update_bucket_counts()
+                    self._populate_tree(self.shown_files)
+                msg = (f'{"Copied" if operation=="copy" else "Moved"} '
+                       f'{done - skipped:,} file(s) to:\n{dest}')
+                if skipped:
+                    msg += f'\n\nSkipped {skipped} missing file(s).'
+                if errors:
+                    msg += f'\n\n{len(errors)} error(s):\n' + '\n'.join(errors[:5])
+                    if len(errors) > 5:
+                        msg += f'\n…and {len(errors)-5} more.'
+                messagebox.showinfo('Done', msg)
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=do_take, daemon=True).start()
+
+    # ── RUN ───────────────────────────────────────────────────────────────────
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == '__main__':
+    FileVault().run()
+
+
+This code is in python but if you want this is the HTML one:
+!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Creator</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a1a; color: #ccc; font-family: 'Segoe UI', sans-serif; font-size: 12px; overflow: hidden; user-select: none; }
+  #app { display: flex; flex-direction: column; width: 100vw; height: 100vh; }
+
+  /* TOP BAR */
+  #topbar {
+    height: 36px; background: #2a2a2a; border-bottom: 1px solid #111;
+    display: flex; align-items: center; padding: 0 10px; gap: 4px; flex-shrink: 0; z-index: 10;
+  }
+  .logo { font-size: 14px; font-weight: 700; color: #e88; margin-right: 12px; letter-spacing: 1px; }
+  .menu-btn {
+    padding: 4px 10px; border-radius: 4px; cursor: pointer; color: #bbb;
+    background: transparent; border: none; font-size: 12px; transition: background 0.1s;
+  }
+  .menu-btn:hover { background: #3a3a3a; color: #fff; }
+  .sep { width: 1px; height: 20px; background: #444; margin: 0 4px; }
+  .toolbar-group { display: flex; gap: 2px; }
+  .tool-btn {
+    width: 28px; height: 28px; border-radius: 4px; border: none; background: transparent;
+    color: #aaa; cursor: pointer; font-size: 14px; display: flex; align-items: center;
+    justify-content: center; transition: background 0.1s, color 0.1s; position: relative;
+  }
+  .tool-btn:hover { background: #3a3a3a; color: #fff; }
+  .tool-btn.active { background: #e87d0d; color: #fff; }
+  .tool-btn[title]:hover::after {
+    content: attr(title); position: absolute; top: 32px; left: 50%; transform: translateX(-50%);
+    background: #111; color: #fff; padding: 3px 7px; border-radius: 3px; white-space: nowrap;
+    font-size: 11px; pointer-events: none; z-index: 100;
+  }
+  .spacer { flex: 1; }
+  .status-info { color: #666; font-size: 11px; padding: 0 8px; }
+
+  /* MAIN AREA */
+  #main { display: flex; flex: 1; overflow: hidden; }
+
+  /* LEFT PANEL */
+  #left-panel {
+    width: 200px; background: #252525; border-right: 1px solid #111;
+    display: flex; flex-direction: column; flex-shrink: 0;
+  }
+  .panel-header {
+    padding: 6px 10px; background: #2a2a2a; border-bottom: 1px solid #111;
+    font-size: 11px; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .add-section { padding: 8px; }
+  .add-section-title { color: #888; font-size: 10px; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px; }
+  .add-btn {
+    display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px;
+    background: transparent; border: none; color: #bbb; cursor: pointer; border-radius: 4px;
+    font-size: 12px; transition: background 0.1s; text-align: left;
+  }
+  .add-btn:hover { background: #333; color: #fff; }
+  .add-btn .icon { font-size: 14px; width: 18px; text-align: center; }
+
+  /* VIEWPORT */
+  #viewport-container {
+    flex: 1; position: relative; background: #1a1a1a; overflow: hidden;
+  }
+  #viewport { width: 100%; height: 100%; display: block; }
+  #viewport-overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none;
+  }
+  .corner-info {
+    position: absolute; top: 8px; left: 8px; color: #888; font-size: 11px; line-height: 1.6;
+  }
+  .view-label {
+    position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+    color: #888; font-size: 11px;
+  }
+  .nav-gizmo {
+    position: absolute; top: 10px; right: 10px; width: 80px; height: 80px;
+  }
+  .shortcut-hint {
+    position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+    color: #555; font-size: 11px; white-space: nowrap;
+  }
+
+  /* RIGHT PANEL */
+  #right-panel {
+    width: 240px; background: #252525; border-left: 1px solid #111;
+    display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto;
+  }
+  .prop-section { border-bottom: 1px solid #1a1a1a; }
+  .prop-header {
+    padding: 6px 10px; background: #2a2a2a; font-size: 11px;
+    font-weight: 600; color: #aaa; text-transform: uppercase; cursor: pointer;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .prop-header:hover { background: #303030; }
+  .prop-body { padding: 8px 10px; }
+  .prop-row { display: flex; align-items: center; margin-bottom: 6px; gap: 6px; }
+  .prop-label { color: #888; width: 55px; flex-shrink: 0; font-size: 11px; }
+  .prop-input {
+    flex: 1; background: #1e1e1e; border: 1px solid #333; color: #ddd;
+    padding: 3px 6px; border-radius: 3px; font-size: 11px; width: 100%;
+    transition: border-color 0.1s;
+  }
+  .prop-input:focus { outline: none; border-color: #e87d0d; }
+  .xyz-row { display: flex; gap: 4px; flex: 1; }
+  .xyz-row input { flex: 1; min-width: 0; }
+  .x-label { color: #e44; } .y-label { color: #8a8; } .z-label { color: #48e; }
+  .color-input { width: 100%; height: 24px; border: none; background: none; cursor: pointer; border-radius: 3px; }
+  .no-selection { color: #555; font-style: italic; padding: 12px 10px; font-size: 11px; }
+  .object-name-input {
+    width: 100%; background: #1e1e1e; border: 1px solid #444; color: #fff;
+    padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; margin-bottom: 8px;
+  }
+  .object-name-input:focus { outline: none; border-color: #e87d0d; }
+
+  /* BOTTOM BAR */
+  #bottombar {
+    height: 24px; background: #1e1e1e; border-top: 1px solid #111;
+    display: flex; align-items: center; padding: 0 10px; gap: 16px; flex-shrink: 0;
+    font-size: 11px; color: #555;
+  }
+  .status-item { display: flex; gap: 4px; }
+  .status-item span { color: #888; }
+
+  /* OUTLINER */
+  .outliner-item {
+    display: flex; align-items: center; padding: 3px 8px; cursor: pointer;
+    gap: 6px; border-radius: 3px; margin: 1px 4px;
+  }
+  .outliner-item:hover { background: #333; }
+  .outliner-item.selected { background: #e87d0d22; color: #e87d0d; }
+  .outliner-item .obj-icon { font-size: 12px; }
+  .outliner-item .obj-name { flex: 1; }
+  .outliner-item .vis-btn { color: #555; font-size: 12px; }
+  .outliner-item .vis-btn:hover { color: #aaa; }
+
+  /* CONTEXT MENU */
+  #ctx-menu {
+    position: fixed; background: #2a2a2a; border: 1px solid #444; border-radius: 6px;
+    padding: 4px; min-width: 160px; z-index: 1000; box-shadow: 0 8px 24px #0008;
+    display: none;
+  }
+  .ctx-item {
+    padding: 6px 12px; border-radius: 4px; cursor: pointer; color: #bbb;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .ctx-item:hover { background: #e87d0d; color: #fff; }
+  .ctx-sep { height: 1px; background: #3a3a3a; margin: 3px 0; }
+  .ctx-item .shortcut { color: #666; font-size: 10px; }
+  .ctx-item:hover .shortcut { color: #fff9; }
+
+  /* NAV CUBE */
+  #nav-cube { position: absolute; top: 10px; right: 10px; cursor: pointer; }
+
+  /* MODAL / OVERLAY */
+  #modal-overlay {
+    display: none; position: fixed; inset: 0; background: #0008; z-index: 200;
+    align-items: center; justify-content: center;
+  }
+  #modal {
+    background: #2a2a2a; border: 1px solid #444; border-radius: 8px;
+    padding: 20px; min-width: 280px; box-shadow: 0 20px 60px #000a;
+  }
+  .modal-title { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 12px; }
+  .modal-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  .btn { padding: 6px 14px; border-radius: 4px; border: none; cursor: pointer; font-size: 12px; }
+  .btn-primary { background: #e87d0d; color: #fff; }
+  .btn-secondary { background: #3a3a3a; color: #bbb; }
+  .btn:hover { filter: brightness(1.1); }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #1a1a1a; }
+  ::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- TOP BAR -->
+  <div id="topbar">
+    <span class="logo">&#9670; 3D Creator</span>
+    <div class="sep"></div>
+    <div class="toolbar-group">
+      <button class="tool-btn active" id="btn-select" title="Select (Q)">&#9654;</button>
+      <button class="tool-btn" id="btn-grab" title="Move (G)">&#10021;</button>
+      <button class="tool-btn" id="btn-rotate" title="Rotate (R)">&#8635;</button>
+      <button class="tool-btn" id="btn-scale" title="Scale (S)">&#8596;</button>
+    </div>
+    <div class="sep"></div>
+    <div class="toolbar-group">
+      <button class="tool-btn" id="btn-view-persp" title="Perspective View (Numpad 5)" style="font-size:11px">PERSP</button>
+      <button class="tool-btn" id="btn-view-top" title="Top View (Numpad 7)" style="font-size:11px">TOP</button>
+      <button class="tool-btn" id="btn-view-front" title="Front View (Numpad 1)" style="font-size:11px">FRONT</button>
+      <button class="tool-btn" id="btn-view-right" title="Right View (Numpad 3)" style="font-size:11px">RIGHT</button>
+    </div>
+    <div class="sep"></div>
+    <div class="toolbar-group">
+      <button class="tool-btn" id="btn-wireframe" title="Toggle Wireframe (Z)">&#9633;</button>
+      <button class="tool-btn" id="btn-grid" title="Toggle Grid">&#35;</button>
+      <button class="tool-btn" id="btn-snap" title="Toggle Snap">&#9887;</button>
+    </div>
+    <div class="sep"></div>
+    <button class="tool-btn" id="btn-delete" title="Delete Selected (X)" style="color:#e44">&#128465;</button>
+    <button class="tool-btn" id="btn-duplicate" title="Duplicate (Shift+D)" style="color:#8bf">&#9112;</button>
+    <div class="spacer"></div>
+    <span class="status-info" id="status-info">Ready</span>
+    <div class="sep"></div>
+    <button class="tool-btn" id="btn-export" title="Export Scene" style="font-size:11px;color:#8bf">EXPORT</button>
+  </div>
+
+  <!-- MAIN -->
+  <div id="main">
+    <!-- LEFT PANEL -->
+    <div id="left-panel">
+      <div class="panel-header">Add Object</div>
+      <div class="add-section">
+        <div class="add-section-title">Mesh</div>
+        <button class="add-btn" data-shape="cube"><span class="icon">&#9635;</span> Cube</button>
+        <button class="add-btn" data-shape="sphere"><span class="icon">&#9711;</span> UV Sphere</button>
+        <button class="add-btn" data-shape="icosphere"><span class="icon">&#9651;</span> Icosphere</button>
+        <button class="add-btn" data-shape="cylinder"><span class="icon">&#9645;</span> Cylinder</button>
+        <button class="add-btn" data-shape="cone"><span class="icon">&#9650;</span> Cone</button>
+        <button class="add-btn" data-shape="torus"><span class="icon">&#9711;</span> Torus</button>
+        <button class="add-btn" data-shape="plane"><span class="icon">&#9645;</span> Plane</button>
+        <button class="add-btn" data-shape="monkey"><span class="icon">&#128053;</span> Monkey</button>
+      </div>
+      <div class="add-section">
+        <div class="add-section-title">Light</div>
+        <button class="add-btn" data-shape="pointlight"><span class="icon">&#9788;</span> Point Light</button>
+        <button class="add-btn" data-shape="spotlight"><span class="icon">&#128304;</span> Spot Light</button>
+      </div>
+      <div class="add-section">
+        <div class="add-section-title">Camera</div>
+        <button class="add-btn" data-shape="camera"><span class="icon">&#128247;</span> Camera</button>
+      </div>
+    </div>
+
+    <!-- VIEWPORT -->
+    <div id="viewport-container">
+      <canvas id="viewport"></canvas>
+      <div id="viewport-overlay">
+        <div class="corner-info" id="corner-info">
+          <div id="view-name-label" style="color:#aaa;font-weight:600;">Perspective</div>
+          <div style="margin-top:4px">Vert: <span id="stat-verts">0</span> | Faces: <span id="stat-faces">0</span> | Objects: <span id="stat-objs">0</span></div>
+        </div>
+        <div class="shortcut-hint">RMB: Context Menu &nbsp;|&nbsp; MMB: Orbit &nbsp;|&nbsp; Scroll: Zoom &nbsp;|&nbsp; Shift+MMB: Pan &nbsp;|&nbsp; G/R/S: Transform</div>
+        <canvas id="nav-cube" width="80" height="80"></canvas>
+      </div>
+    </div>
+
+    <!-- RIGHT PANEL -->
+    <div id="right-panel">
+      <div class="panel-header">Scene Outliner</div>
+      <div id="outliner" style="padding: 4px 0; min-height: 80px; max-height: 180px; overflow-y: auto; border-bottom: 1px solid #111;"></div>
+
+      <div class="panel-header">Properties</div>
+      <div id="props-panel">
+        <div class="no-selection">No object selected</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- BOTTOM BAR -->
+  <div id="bottombar">
+    <div class="status-item">Mode: <span id="bottom-mode">Object Mode</span></div>
+    <div class="status-item">Tool: <span id="bottom-tool">Select</span></div>
+    <div class="status-item">Selected: <span id="bottom-sel">None</span></div>
+    <div style="flex:1"></div>
+    <div class="status-item" id="fps-counter">FPS: --</div>
+  </div>
+</div>
+
+<!-- CONTEXT MENU -->
+<div id="ctx-menu">
+  <div class="ctx-item" data-action="add-cube">Add Cube</div>
+  <div class="ctx-item" data-action="add-sphere">Add Sphere</div>
+  <div class="ctx-item" data-action="add-plane">Add Plane</div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" data-action="duplicate">Duplicate <span class="shortcut">Shift+D</span></div>
+  <div class="ctx-item" data-action="delete">Delete <span class="shortcut">X</span></div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" data-action="focus">Focus Selected <span class="shortcut">Numpad .</span></div>
+  <div class="ctx-item" data-action="select-all">Select All <span class="shortcut">A</span></div>
+  <div class="ctx-item" data-action="deselect-all">Deselect All <span class="shortcut">Alt+A</span></div>
+</div>
+
+<!-- EXPORT MODAL -->
+<div id="modal-overlay" style="display:none;align-items:center;justify-content:center;">
+  <div id="modal">
+    <div class="modal-title">Export Scene</div>
+    <p style="color:#888;font-size:12px;margin-bottom:12px;">Download scene as JSON (re-importable) or OBJ.</p>
+    <div class="modal-row" style="justify-content:flex-start;gap:8px;margin-top:0">
+      <button class="btn btn-primary" id="export-json">Export JSON</button>
+      <button class="btn btn-primary" id="export-obj">Export OBJ</button>
+    </div>
+    <div class="modal-row">
+      <button class="btn btn-secondary" id="modal-close">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+
+// ─── SCENE SETUP ────────────────────────────────────────────────────────────
+const canvas = document.getElementById('viewport');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1;
+renderer.setClearColor(0x1a1a1a);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1c1c1c);
+scene.fog = new THREE.FogExp2(0x1c1c1c, 0.005);
+
+const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 10000);
+camera.position.set(5, 4, 7);
+camera.lookAt(0, 0, 0);
+
+// ─── CONTROLS ────────────────────────────────────────────────────────────────
+const orbitControls = new OrbitControls(camera, canvas);
+orbitControls.enableDamping = true;
+orbitControls.dampingFactor = 0.08;
+orbitControls.screenSpacePanning = true;
+orbitControls.minDistance = 0.1;
+orbitControls.maxDistance = 500;
+
+const transformControls = new TransformControls(camera, canvas);
+transformControls.setSize(0.8);
+scene.add(transformControls);
+transformControls.addEventListener('dragging-changed', e => {
+  orbitControls.enabled = !e.value;
+  if (!e.value) syncPropsFromObject();
+});
+transformControls.addEventListener('change', () => {
+  if (transformControls.dragging) syncPropsFromObject();
+});
+transformControls.addEventListener('objectChange', () => syncPropsFromObject());
+
+// ─── LIGHTING ────────────────────────────────────────────────────────────────
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const sunLight = new THREE.DirectionalLight(0xfff8e7, 1.2);
+sunLight.position.set(8, 12, 6);
+sunLight.castShadow = true;
+sunLight.shadow.mapSize.set(2048, 2048);
+sunLight.shadow.camera.near = 0.5;
+sunLight.shadow.camera.far = 100;
+sunLight.shadow.camera.left = sunLight.shadow.camera.bottom = -20;
+sunLight.shadow.camera.right = sunLight.shadow.camera.top = 20;
+sunLight.shadow.bias = -0.001;
+scene.add(sunLight);
+
+const fillLight = new THREE.DirectionalLight(0x4488ff, 0.3);
+fillLight.position.set(-5, 3, -8);
+scene.add(fillLight);
+
+// ─── GRID & HELPERS ──────────────────────────────────────────────────────────
+const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x2a2a2a);
+scene.add(gridHelper);
+
+const axesHelper = new THREE.AxesHelper(1);
+axesHelper.position.set(-9.5, 0.01, -9.5);
+scene.add(axesHelper);
+
+// Ground plane (invisible, for shadows)
+const groundGeo = new THREE.PlaneGeometry(100, 100);
+const groundMat = new THREE.ShadowMaterial({ opacity: 0.2 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.001;
+ground.receiveShadow = true;
+ground.userData.isHelper = true;
+scene.add(ground);
+
+// ─── STATE ───────────────────────────────────────────────────────────────────
+let objects = [];          // all user objects
+let selectedObject = null;
+let currentTool = 'select'; // select | grab | rotate | scale
+let isWireframe = false;
+let showGrid = true;
+let snapEnabled = false;
+let viewMode = 'persp';
+let objectCounter = {};
+let frameCount = 0, lastFPSTime = performance.now();
+
+// ─── INITIAL DEFAULT CUBE ────────────────────────────────────────────────────
+addObject('cube');
+
+// ─── ADD OBJECT ──────────────────────────────────────────────────────────────
+function addObject(type) {
+  let mesh;
+  const mat = new THREE.MeshStandardMaterial({
+    color: randomColor(),
+    roughness: 0.6,
+    metalness: 0.05,
+  });
+
+  if (!objectCounter[type]) objectCounter[type] = 0;
+  objectCounter[type]++;
+  const name = capitalize(type) + '.' + String(objectCounter[type]).padStart(3,'0');
+
+  switch (type) {
+    case 'cube':
+      mesh = new THREE.Mesh(new THREE.BoxGeometry(2,2,2), mat);
+      break;
+    case 'sphere':
+      mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 24), mat);
+      break;
+    case 'icosphere':
+      mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 2), mat);
+      break;
+    case 'cylinder':
+      mesh = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 2, 32), mat);
+      break;
+    case 'cone':
+      mesh = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 32), mat);
+      break;
+    case 'torus':
+      mesh = new THREE.Mesh(new THREE.TorusGeometry(1, 0.35, 16, 64), mat);
+      break;
+    case 'plane':
+      mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshStandardMaterial({ color: randomColor(), roughness: 0.8, side: THREE.DoubleSide }));
+      mesh.rotation.x = -Math.PI / 2;
+      break;
+    case 'monkey': {
+      // Suzanne approximation using merged spheres
+      const g = new THREE.SphereGeometry(1, 16, 12);
+      mesh = new THREE.Mesh(g, mat);
+      mesh.userData.isSuzanne = true;
+      break;
+    }
+    case 'pointlight': {
+      const light = new THREE.PointLight(0xffffff, 1, 20);
+      light.position.set(0, 3, 0);
+      light.castShadow = true;
+      light.userData.name = name;
+      light.userData.type = 'pointlight';
+      light.userData.isLight = true;
+      const helper = new THREE.PointLightHelper(light, 0.3);
+      scene.add(light, helper);
+      objects.push(light);
+      light.userData.helper = helper;
+      selectObject(light);
+      updateOutliner();
+      updateStats();
+      return;
+    }
+    case 'spotlight': {
+      const sLight = new THREE.SpotLight(0xffffff, 1);
+      sLight.position.set(0, 5, 0);
+      sLight.castShadow = true;
+      sLight.angle = Math.PI / 6;
+      sLight.userData.name = name;
+      sLight.userData.type = 'spotlight';
+      sLight.userData.isLight = true;
+      const sHelper = new THREE.SpotLightHelper(sLight);
+      scene.add(sLight, sHelper);
+      objects.push(sLight);
+      sLight.userData.helper = sHelper;
+      selectObject(sLight);
+      updateOutliner();
+      updateStats();
+      return;
+    }
+    case 'camera': {
+      const cam = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+      cam.position.set(0, 2, 5);
+      const helper = new THREE.CameraHelper(cam);
+      scene.add(cam, helper);
+      cam.userData.name = name;
+      cam.userData.type = 'camera';
+      cam.userData.isCamera = true;
+      cam.userData.helper = helper;
+      objects.push(cam);
+      selectObject(cam);
+      updateOutliner();
+      updateStats();
+      return;
+    }
+    default:
+      mesh = new THREE.Mesh(new THREE.BoxGeometry(2,2,2), mat);
+  }
+
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.userData.name = name;
+  mesh.userData.type = type;
+
+  // Place at viewport center offset
+  const offset = objects.length * 0.2;
+  mesh.position.set(Math.sin(offset) * 0.5, 0, Math.cos(offset) * 0.5);
+
+  scene.add(mesh);
+  objects.push(mesh);
+  selectObject(mesh);
+  updateOutliner();
+  updateStats();
+}
+
+function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+function randomColor() {
+  const hue = Math.random();
+  return new THREE.Color().setHSL(hue, 0.5, 0.55);
+}
+
+// ─── SELECTION ───────────────────────────────────────────────────────────────
+const outlineMat = new THREE.MeshBasicMaterial({ color: 0xe87d0d, side: THREE.BackSide });
+let outlineMesh = null;
+
+function selectObject(obj) {
+  if (outlineMesh) { scene.remove(outlineMesh); outlineMesh = null; }
+  selectedObject = obj;
+  if (obj && obj.isMesh) {
+    transformControls.attach(obj);
+    // Outline
+    const og = new THREE.Mesh(obj.geometry, outlineMat);
+    og.scale.multiplyScalar(1.04);
+    og.position.copy(obj.position);
+    og.rotation.copy(obj.rotation);
+    og.scale.multiply(obj.scale).multiplyScalar(1.04);
+    obj.add(og);
+    outlineMesh = og;
+  } else if (obj) {
+    transformControls.attach(obj);
+  } else {
+    transformControls.detach();
+  }
+  updatePropsPanel();
+  updateOutliner();
+  document.getElementById('bottom-sel').textContent = obj ? (obj.userData.name || 'Object') : 'None';
+}
+
+function deleteSelected() {
+  if (!selectedObject) return;
+  const obj = selectedObject;
+  selectObject(null);
+  scene.remove(obj);
+  if (obj.userData.helper) scene.remove(obj.userData.helper);
+  objects = objects.filter(o => o !== obj);
+  if (obj.geometry) obj.geometry.dispose();
+  if (obj.material) obj.material.dispose();
+  updateOutliner();
+  updateStats();
+}
+
+function duplicateSelected() {
+  if (!selectedObject || !selectedObject.isMesh) return;
+  const orig = selectedObject;
+  const newMesh = new THREE.Mesh(orig.geometry.clone(), orig.material.clone());
+  newMesh.position.copy(orig.position).addScalar(0.5);
+  newMesh.rotation.copy(orig.rotation);
+  newMesh.scale.copy(orig.scale);
+  newMesh.castShadow = true;
+  newMesh.receiveShadow = true;
+  const baseName = orig.userData.name.replace(/\.\d+$/, '');
+  if (!objectCounter[baseName]) objectCounter[baseName] = 0;
+  objectCounter[baseName]++;
+  newMesh.userData.name = baseName + '.' + String(objectCounter[baseName]).padStart(3,'0');
+  newMesh.userData.type = orig.userData.type;
+  scene.add(newMesh);
+  objects.push(newMesh);
+  selectObject(newMesh);
+  updateOutliner();
+  updateStats();
+}
+
+// ─── RAYCASTING / CLICK ──────────────────────────────────────────────────────
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  if (transformControls.dragging) return;
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const meshes = objects.filter(o => o.isMesh);
+  const hits = raycaster.intersectObjects(meshes, false);
+  if (hits.length > 0) {
+    selectObject(hits[0].object);
+  } else {
+    const isOnGizmo = transformControls.axis !== null;
+    if (!isOnGizmo) selectObject(null);
+  }
+});
+
+// ─── PROPS PANEL ─────────────────────────────────────────────────────────────
+function updatePropsPanel() {
+  const panel = document.getElementById('props-panel');
+  if (!selectedObject) {
+    panel.innerHTML = '<div class="no-selection">No object selected</div>';
+    return;
+  }
+  const obj = selectedObject;
+  const p = obj.position, r = obj.rotation, s = obj.scale;
+  const isLight = obj.userData.isLight;
+  const isCam = obj.userData.isCamera;
+
+  const colorHex = obj.material ? '#' + obj.material.color.getHexString() : '#ffffff';
+
+  panel.innerHTML = `
+    <div class="prop-section">
+      <div class="prop-header">&#9654; Object</div>
+      <div class="prop-body">
+        <input class="object-name-input" id="prop-name" value="${obj.userData.name}" />
+        <div class="prop-row">
+          <span class="prop-label">Type</span>
+          <span style="color:#888">${capitalize(obj.userData.type || 'mesh')}</span>
+        </div>
+      </div>
+    </div>
+    <div class="prop-section">
+      <div class="prop-header">&#9654; Transform</div>
+      <div class="prop-body">
+        <div class="prop-row">
+          <span class="prop-label">Location</span>
+          <div class="xyz-row">
+            <input class="prop-input" id="px" type="number" step="0.1" value="${p.x.toFixed(3)}">
+            <input class="prop-input" id="py" type="number" step="0.1" value="${p.y.toFixed(3)}">
+            <input class="prop-input" id="pz" type="number" step="0.1" value="${p.z.toFixed(3)}">
+          </div>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">Rotation</span>
+          <div class="xyz-row">
+            <input class="prop-input" id="rx" type="number" step="1" value="${(r.x*180/Math.PI).toFixed(1)}">
+            <input class="prop-input" id="ry" type="number" step="1" value="${(r.y*180/Math.PI).toFixed(1)}">
+            <input class="prop-input" id="rz" type="number" step="1" value="${(r.z*180/Math.PI).toFixed(1)}">
+          </div>
+        </div>
+        ${!isLight && !isCam ? `
+        <div class="prop-row">
+          <span class="prop-label">Scale</span>
+          <div class="xyz-row">
+            <input class="prop-input" id="sx" type="number" step="0.01" value="${s.x.toFixed(3)}">
+            <input class="prop-input" id="sy" type="number" step="0.01" value="${s.y.toFixed(3)}">
+            <input class="prop-input" id="sz" type="number" step="0.01" value="${s.z.toFixed(3)}">
+          </div>
+        </div>` : ''}
+      </div>
+    </div>
+    ${obj.material ? `
+    <div class="prop-section">
+      <div class="prop-header">&#9654; Material</div>
+      <div class="prop-body">
+        <div class="prop-row">
+          <span class="prop-label">Color</span>
+          <input type="color" class="prop-input color-input" id="mat-color" value="${colorHex}">
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">Roughness</span>
+          <input class="prop-input" id="mat-rough" type="range" min="0" max="1" step="0.01" value="${obj.material.roughness}" style="padding:4px 0;cursor:pointer">
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">Metalness</span>
+          <input class="prop-input" id="mat-metal" type="range" min="0" max="1" step="0.01" value="${obj.material.metalness}" style="padding:4px 0;cursor:pointer">
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">Opacity</span>
+          <input class="prop-input" id="mat-opacity" type="range" min="0" max="1" step="0.01" value="${obj.material.opacity}" style="padding:4px 0;cursor:pointer">
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">Wireframe</span>
+          <input type="checkbox" id="mat-wire" ${obj.material.wireframe ? 'checked':''} style="cursor:pointer">
+        </div>
+      </div>
+    </div>` : ''}
+    ${isLight ? `
+    <div class="prop-section">
+      <div class="prop-header">&#9654; Light</div>
+      <div class="prop-body">
+        <div class="prop-row">
+          <span class="prop-label">Color</span>
+          <input type="color" class="prop-input color-input" id="light-color" value="#${obj.color.getHexString()}">
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">Intensity</span>
+          <input class="prop-input" id="light-int" type="range" min="0" max="5" step="0.05" value="${obj.intensity}" style="padding:4px 0;cursor:pointer">
+        </div>
+      </div>
+    </div>` : ''}
+  `;
+
+  // Bind inputs
+  const bind = (id, fn) => { const el = document.getElementById(id); if(el) el.addEventListener('input', fn); };
+  bind('prop-name', e => { selectedObject.userData.name = e.target.value; updateOutliner(); });
+  bind('px', e => { selectedObject.position.x = parseFloat(e.target.value)||0; });
+  bind('py', e => { selectedObject.position.y = parseFloat(e.target.value)||0; });
+  bind('pz', e => { selectedObject.position.z = parseFloat(e.target.value)||0; });
+  bind('rx', e => { selectedObject.rotation.x = (parseFloat(e.target.value)||0)*Math.PI/180; });
+  bind('ry', e => { selectedObject.rotation.y = (parseFloat(e.target.value)||0)*Math.PI/180; });
+  bind('rz', e => { selectedObject.rotation.z = (parseFloat(e.target.value)||0)*Math.PI/180; });
+  bind('sx', e => { selectedObject.scale.x = parseFloat(e.target.value)||0.001; });
+  bind('sy', e => { selectedObject.scale.y = parseFloat(e.target.value)||0.001; });
+  bind('sz', e => { selectedObject.scale.z = parseFloat(e.target.value)||0.001; });
+  bind('mat-color', e => { selectedObject.material.color.set(e.target.value); });
+  bind('mat-rough', e => { selectedObject.material.roughness = parseFloat(e.target.value); });
+  bind('mat-metal', e => { selectedObject.material.metalness = parseFloat(e.target.value); });
+  bind('mat-opacity', e => {
+    selectedObject.material.opacity = parseFloat(e.target.value);
+    selectedObject.material.transparent = parseFloat(e.target.value) < 1;
+  });
+  bind('mat-wire', e => { selectedObject.material.wireframe = e.target.checked; });
+  bind('light-color', e => { selectedObject.color.set(e.target.value); });
+  bind('light-int', e => { selectedObject.intensity = parseFloat(e.target.value); });
+}
+
+function syncPropsFromObject() {
+  if (!selectedObject) return;
+  const obj = selectedObject;
+  const setVal = (id, v) => { const el = document.getElementById(id); if(el) el.value = v; };
+  setVal('px', obj.position.x.toFixed(3));
+  setVal('py', obj.position.y.toFixed(3));
+  setVal('pz', obj.position.z.toFixed(3));
+  setVal('rx', (obj.rotation.x*180/Math.PI).toFixed(1));
+  setVal('ry', (obj.rotation.y*180/Math.PI).toFixed(1));
+  setVal('rz', (obj.rotation.z*180/Math.PI).toFixed(1));
+  if (!obj.userData.isLight && !obj.userData.isCamera) {
+    setVal('sx', obj.scale.x.toFixed(3));
+    setVal('sy', obj.scale.y.toFixed(3));
+    setVal('sz', obj.scale.z.toFixed(3));
+  }
+}
+
+// ─── OUTLINER ────────────────────────────────────────────────────────────────
+const ICONS = { cube:'&#9635;', sphere:'&#9711;', cylinder:'&#9645;', cone:'&#9650;', torus:'&#9711;', plane:'&#9645;', monkey:'&#128053;', icosphere:'&#9651;', pointlight:'&#9788;', spotlight:'&#128304;', camera:'&#128247;' };
+
+function updateOutliner() {
+  const ol = document.getElementById('outliner');
+  ol.innerHTML = '';
+  objects.forEach(obj => {
+    const item = document.createElement('div');
+    item.className = 'outliner-item' + (obj === selectedObject ? ' selected' : '');
+    const icon = ICONS[obj.userData.type] || '&#9636;';
+    item.innerHTML = `<span class="obj-icon">${icon}</span><span class="obj-name">${obj.userData.name}</span>`;
+    item.addEventListener('click', () => selectObject(obj));
+    ol.appendChild(item);
+  });
+}
+
+function updateStats() {
+  let verts = 0, faces = 0;
+  objects.forEach(o => {
+    if (o.geometry) {
+      verts += o.geometry.attributes.position ? o.geometry.attributes.position.count : 0;
+      faces += o.geometry.index ? o.geometry.index.count / 3 : (o.geometry.attributes.position ? o.geometry.attributes.position.count / 3 : 0);
+    }
+  });
+  document.getElementById('stat-verts').textContent = verts;
+  document.getElementById('stat-faces').textContent = Math.round(faces);
+  document.getElementById('stat-objs').textContent = objects.length;
+}
+
+// ─── TOOLBAR TOOLS ───────────────────────────────────────────────────────────
+function setTool(tool) {
+  currentTool = tool;
+  document.querySelectorAll('.tool-btn[id^="btn-"]').forEach(b => b.classList.remove('active'));
+  const map = { select: 'btn-select', grab: 'btn-grab', rotate: 'btn-rotate', scale: 'btn-scale' };
+  if (map[tool]) document.getElementById(map[tool])?.classList.add('active');
+  const labels = { select: 'Select', grab: 'Move', rotate: 'Rotate', scale: 'Scale' };
+  document.getElementById('bottom-tool').textContent = labels[tool] || tool;
+  if (selectedObject) {
+    if (tool === 'grab') transformControls.setMode('translate');
+    else if (tool === 'rotate') transformControls.setMode('rotate');
+    else if (tool === 'scale') transformControls.setMode('scale');
+    else transformControls.setMode('translate');
+  }
+  document.getElementById('status-info').textContent = `Tool: ${labels[tool]||tool}`;
+}
+
+document.getElementById('btn-select').addEventListener('click', () => setTool('select'));
+document.getElementById('btn-grab').addEventListener('click', () => setTool('grab'));
+document.getElementById('btn-rotate').addEventListener('click', () => setTool('rotate'));
+document.getElementById('btn-scale').addEventListener('click', () => setTool('scale'));
+
+document.getElementById('btn-delete').addEventListener('click', deleteSelected);
+document.getElementById('btn-duplicate').addEventListener('click', duplicateSelected);
+
+// Wireframe
+document.getElementById('btn-wireframe').addEventListener('click', () => {
+  isWireframe = !isWireframe;
+  document.getElementById('btn-wireframe').classList.toggle('active', isWireframe);
+  objects.forEach(o => { if(o.material) o.material.wireframe = isWireframe; });
+});
+
+// Grid
+document.getElementById('btn-grid').addEventListener('click', () => {
+  showGrid = !showGrid;
+  gridHelper.visible = showGrid;
+  document.getElementById('btn-grid').classList.toggle('active', !showGrid);
+});
+
+// Snap
+document.getElementById('btn-snap').addEventListener('click', () => {
+  snapEnabled = !snapEnabled;
+  transformControls.setTranslationSnap(snapEnabled ? 0.5 : null);
+  transformControls.setRotationSnap(snapEnabled ? Math.PI / 12 : null);
+  transformControls.setScaleSnap(snapEnabled ? 0.25 : null);
+  document.getElementById('btn-snap').classList.toggle('active', snapEnabled);
+});
+
+// Add buttons
+document.querySelectorAll('.add-btn').forEach(btn => {
+  btn.addEventListener('click', () => addObject(btn.dataset.shape));
+});
+
+// ─── CAMERA VIEWS ────────────────────────────────────────────────────────────
+function setView(v) {
+  viewMode = v;
+  const d = 10;
+  const views = {
+    persp: { pos: [5,4,7], look: [0,0,0] },
+    top:   { pos: [0,d,0], look: [0,0,0] },
+    front: { pos: [0,0,d], look: [0,0,0] },
+    right: { pos: [d,0,0], look: [0,0,0] },
+  };
+  const v2 = views[v] || views.persp;
+  camera.position.set(...v2.pos);
+  orbitControls.target.set(...v2.look);
+  orbitControls.update();
+  const labels = { persp: 'Perspective', top: 'Top (Ortho)', front: 'Front (Ortho)', right: 'Right (Ortho)' };
+  document.getElementById('view-name-label').textContent = labels[v] || v;
+  ['btn-view-persp','btn-view-top','btn-view-front','btn-view-right'].forEach(id => document.getElementById(id)?.classList.remove('active'));
+  document.getElementById('btn-view-'+v)?.classList.add('active');
+}
+document.getElementById('btn-view-persp').addEventListener('click', () => setView('persp'));
+document.getElementById('btn-view-top').addEventListener('click', () => setView('top'));
+document.getElementById('btn-view-front').addEventListener('click', () => setView('front'));
+document.getElementById('btn-view-right').addEventListener('click', () => setView('right'));
+
+// ─── KEYBOARD SHORTCUTS ──────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  switch (e.key.toLowerCase()) {
+    case 'q': setTool('select'); break;
+    case 'g': setTool('grab'); break;
+    case 'r': setTool('rotate'); break;
+    case 's': if (!e.ctrlKey && !e.metaKey) setTool('scale'); break;
+    case 'x': case 'delete': deleteSelected(); break;
+    case 'a':
+      if (e.altKey) selectObject(null);
+      else { objects.length && selectObject(objects[objects.length-1]); }
+      break;
+    case 'd':
+      if (e.shiftKey) duplicateSelected();
+      break;
+    case 'z': {
+      isWireframe = !isWireframe;
+      objects.forEach(o => { if(o.material) o.material.wireframe = isWireframe; });
+      document.getElementById('btn-wireframe').classList.toggle('active', isWireframe);
+      break;
+    }
+    case 'f': focusSelected(); break;
+    case '1': if(!e.ctrlKey) setView('front'); break;
+    case '3': if(!e.ctrlKey) setView('right'); break;
+    case '5': setView(viewMode === 'persp' ? 'top' : 'persp'); break;
+    case '7': setView('top'); break;
+    case 'escape': selectObject(null); break;
+  }
+});
+
+function focusSelected() {
+  if (!selectedObject) return;
+  const pos = selectedObject.position;
+  orbitControls.target.copy(pos);
+  camera.position.copy(pos).add(new THREE.Vector3(3,2,3));
+  orbitControls.update();
+}
+
+// ─── CONTEXT MENU ────────────────────────────────────────────────────────────
+const ctxMenu = document.getElementById('ctx-menu');
+canvas.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  ctxMenu.style.display = 'block';
+  ctxMenu.style.left = e.clientX + 'px';
+  ctxMenu.style.top = e.clientY + 'px';
+  // Check if we right-clicked an object
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(objects.filter(o=>o.isMesh), false);
+  if (hits.length > 0) selectObject(hits[0].object);
+});
+document.addEventListener('click', () => { ctxMenu.style.display = 'none'; });
+document.querySelectorAll('.ctx-item').forEach(item => {
+  item.addEventListener('click', () => {
+    const a = item.dataset.action;
+    if (a === 'add-cube') addObject('cube');
+    else if (a === 'add-sphere') addObject('sphere');
+    else if (a === 'add-plane') addObject('plane');
+    else if (a === 'duplicate') duplicateSelected();
+    else if (a === 'delete') deleteSelected();
+    else if (a === 'focus') focusSelected();
+    else if (a === 'select-all') { objects.length && selectObject(objects[objects.length-1]); }
+    else if (a === 'deselect-all') selectObject(null);
+    ctxMenu.style.display = 'none';
+  });
+});
+
+// ─── EXPORT ──────────────────────────────────────────────────────────────────
+document.getElementById('btn-export').addEventListener('click', () => {
+  document.getElementById('modal-overlay').style.display = 'flex';
+});
+document.getElementById('modal-close').addEventListener('click', () => {
+  document.getElementById('modal-overlay').style.display = 'none';
+});
+document.getElementById('export-json').addEventListener('click', () => {
+  const data = objects.map(o => ({
+    name: o.userData.name, type: o.userData.type,
+    position: o.position.toArray(),
+    rotation: [o.rotation.x, o.rotation.y, o.rotation.z],
+    scale: o.scale ? o.scale.toArray() : [1,1,1],
+    color: o.material ? '#'+o.material.color.getHexString() : '#ffffff',
+  }));
+  const blob = new Blob([JSON.stringify({ objects: data }, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'scene.json'; a.click();
+  document.getElementById('modal-overlay').style.display = 'none';
+});
+document.getElementById('export-obj').addEventListener('click', () => {
+  let obj_str = '# 3D Creator Export\n';
+  let vtxOffset = 1;
+  objects.filter(o => o.isMesh && o.geometry).forEach(mesh => {
+    obj_str += `\no ${mesh.userData.name}\n`;
+    const pos = mesh.geometry.attributes.position;
+    const mat4 = mesh.matrixWorld;
+    for (let i = 0; i < pos.count; i++) {
+      const v = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(mat4);
+      obj_str += `v ${v.x.toFixed(4)} ${v.y.toFixed(4)} ${v.z.toFixed(4)}\n`;
+    }
+    if (mesh.geometry.index) {
+      const idx = mesh.geometry.index;
+      for (let i = 0; i < idx.count; i += 3) {
+        obj_str += `f ${idx.getX(i)+vtxOffset} ${idx.getX(i+1)+vtxOffset} ${idx.getX(i+2)+vtxOffset}\n`;
+      }
+    }
+    vtxOffset += pos.count;
+  });
+  const blob = new Blob([obj_str], { type: 'text/plain' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'scene.obj'; a.click();
+  document.getElementById('modal-overlay').style.display = 'none';
+});
+
+// ─── NAV CUBE GIZMO ──────────────────────────────────────────────────────────
+const navCanvas = document.getElementById('nav-cube');
+const navCtx = navCanvas.getContext('2d');
+
+function drawNavCube() {
+  navCtx.clearRect(0, 0, 80, 80);
+  const cx = 40, cy = 40, r = 28;
+  // Simple axis indicator
+  const axes = [
+    { dir: new THREE.Vector3(1,0,0), color:'#e44', label:'X' },
+    { dir: new THREE.Vector3(0,1,0), color:'#4a4', label:'Y' },
+    { dir: new THREE.Vector3(0,0,1), color:'#48e', label:'Z' },
+  ];
+  axes.forEach(ax => {
+    const proj = ax.dir.clone().project(camera);
+    const x = cx + proj.x * r;
+    const y = cy - proj.y * r;
+    navCtx.strokeStyle = ax.color;
+    navCtx.lineWidth = 2;
+    navCtx.beginPath();
+    navCtx.moveTo(cx, cy);
+    navCtx.lineTo(x, y);
+    navCtx.stroke();
+    navCtx.fillStyle = ax.color;
+    navCtx.beginPath();
+    navCtx.arc(x, y, 5, 0, Math.PI*2);
+    navCtx.fill();
+    navCtx.fillStyle = '#fff';
+    navCtx.font = 'bold 9px sans-serif';
+    navCtx.textAlign = 'center';
+    navCtx.textBaseline = 'middle';
+    navCtx.fillText(ax.label, x, y);
+  });
+}
+
+// ─── RESIZE ──────────────────────────────────────────────────────────────────
+function resize() {
+  const c = document.getElementById('viewport-container');
+  const w = c.clientWidth, h = c.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ─── RENDER LOOP ─────────────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  orbitControls.update();
+
+  // Update transform controls to match tool mode
+  if (selectedObject) {
+    if (currentTool === 'grab') transformControls.setMode('translate');
+    else if (currentTool === 'rotate') transformControls.setMode('rotate');
+    else if (currentTool === 'scale') transformControls.setMode('scale');
+    else transformControls.setMode('translate');
+    transformControls.visible = (currentTool !== 'select');
+  }
+
+  // Update spot light helpers
+  objects.forEach(o => {
+    if (o.userData.helper && o.userData.type === 'spotlight') o.userData.helper.update();
+  });
+
+  renderer.render(scene, camera);
+  drawNavCube();
+
+  // FPS
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFPSTime > 1000) {
+    document.getElementById('fps-counter').textContent = `FPS: ${frameCount}`;
+    frameCount = 0; lastFPSTime = now;
+  }
+}
+animate();
+
+setTool('select');
+updateOutliner();
+updateStats();
+</script>
+</body>
+</html>
+
+But I don't know the HTML version is better than python version so I prefer python version.
